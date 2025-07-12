@@ -6,4 +6,3 @@ twilio
 schedule
 openai-agents
 pyautogui
-webbrowser
