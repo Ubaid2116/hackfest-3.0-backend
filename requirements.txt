@@ -1,6 +1,9 @@
 fastapi
 uvicorn
+pydantic
 python-dotenv
 twilio
-openai
 schedule
+openai-agents
+pyautogui
+webbrowser
