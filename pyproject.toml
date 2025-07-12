@@ -1,0 +1,21 @@
+[project]
+name = "hello-agent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "boto3>=1.39.4",
+    "browser-use>=0.3.2",
+    "fastapi>=0.116.1",
+    "openai-agents>=0.1.0",
+    "pyautogui>=0.9.54",
+    "pydantic>=2.11.5",
+    "schedule>=1.2.2",
+    "twilio>=9.6.5",
+]
+
+[tool.uv.workspace]
+members = [
+    "hello_agent",
+]
