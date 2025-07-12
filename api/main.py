@@ -290,13 +290,13 @@ app.add_middleware(
 async def startup_event():
     await Runner.run(welcome_agent, input="Hello", run_config=config)
 
-@app.post("/register")
+@app.post("/api/register")
 async def register_patient(reg: PatientRegistration):
     user_input = f"Service: {reg.service}\nName: {reg.name}\nPhone: {reg.phone}\nAge: {reg.age}"
     result = await Runner.run(registration_agent, input=user_input, run_config=config)
     return {"response": result.final_output, "next_agent": result.last_agent.name}
 
-@app.post("/query")
+@app.post("/api/query")
 async def agent_query(query: AgentQuery):
     agents = {
         a.name: a for a in [
@@ -310,7 +310,7 @@ async def agent_query(query: AgentQuery):
     result = await Runner.run(agent, input=query.message, run_config=config)
     return {"response": result.final_output}
 
-@app.post("/emergency")
+@app.post("/api/emergency")
 def send_emergency_alert(alert: EmergencyAlert):
     # Build the message
     msg = (
@@ -324,7 +324,7 @@ def send_emergency_alert(alert: EmergencyAlert):
 
     return {"status": "Emergency message opened in WhatsApp Web"}
 
-@app.post("/medicine-reminder")
+@app.post("/api/medicine-reminder")
 def create_reminder(rem: ReminderRequest):
     if not rem.phone.isdigit():
         raise HTTPException(status_code=400, detail="Phone must be digits like 923001234567")
@@ -337,7 +337,7 @@ def create_reminder(rem: ReminderRequest):
         "time": rem.reminder_time
     }
 
-@app.get("/services")
+@app.get("/api/services")
 def list_services():
     return {
         "services": [
