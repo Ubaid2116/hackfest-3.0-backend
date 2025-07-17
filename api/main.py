@@ -11,9 +11,17 @@ from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 import requests
 from collections import deque
 import uuid
+from contextlib import asynccontextmanager
 from agents import Agent, handoff, Runner, RunConfig, OpenAIChatCompletionsModel, function_tool, AsyncOpenAI
 
 load_dotenv()
+
+def make_filter(keyword: str):
+    """
+    Returns a function that checks if the keyword appears in the user input (case-insensitive).
+    """
+    lower_keyword = keyword.lower()
+    return lambda text: lower_keyword in text.lower()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 JOBSTORE_DB_URL = os.getenv("JOBSTORE_DB_URL", "sqlite:///jobs.sqlite")
@@ -32,7 +40,7 @@ scheduler.start()
 # OpenAI/Gemini client setup
 external_client = AsyncOpenAI(
     api_key=GEMINI_API_KEY,
-    base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+    base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
 )
 model = OpenAIChatCompletionsModel(
     model="gemini-2.0-flash",
@@ -167,7 +175,6 @@ Do not provide medical advice. Focus only on detecting emergencies and triggerin
     tools=[_trigger_emergency_alert]
 )
 
-
 medicine_agent = Agent(
     name="Medicine Reminder Agent",
     instructions="""
@@ -204,10 +211,6 @@ registration_agent = Agent(name="Registration Agent", instructions="""
 Collect name, email, age, desired service and hand off accordingly.
 """)
 
-# Registration handoffs
-def make_filter(keyword: str):
-    return lambda x: x if keyword in x.input_history.lower() else None
-
 registration_agent.handoffs = [
     handoff(health_agent, input_filter=make_filter("health")),
     handoff(mental_health_agent, input_filter=make_filter("mental")),
@@ -225,10 +228,21 @@ def get_memory_deque(session_id: str):
         short_memory[session_id] = deque(maxlen=SHORT_TERM_MEMORY_TURNS)
     return short_memory[session_id]
 
-# FastAPI app setup
-app = FastAPI(title="NeuroNestAI Healthcare API", version="2.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
-                   allow_methods=["*"], allow_headers=["*"])
+# FastAPI app setup with lifespan
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await Runner.run(welcome_agent, input="Hello", run_config=config)
+    yield
+    scheduler.shutdown()
+
+app = FastAPI(title="NeuroNestAI Healthcare API", version="2.0.0", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Update to your frontend URL in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 class ChatRequest(BaseModel):
     message: str
@@ -246,10 +260,6 @@ agents = {
     "Diet Agent": diet_agent,
     "Registration Agent": registration_agent,
 }
-
-@app.on_event("startup")
-async def startup_event():
-    await Runner.run(welcome_agent, input="Hello", run_config=config)
 
 def parse_emergency_input(message: str) -> tuple[str, str]:
     patient_name = "Unknown"
@@ -271,21 +281,20 @@ async def chat_with_agent(chat: ChatRequest):
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
 
-    # Add user message to memory buffer
     mem = get_memory_deque(chat.session_id)
     mem.append({"role": "user", "message": chat.message})
 
-    # Compose contextual prompt
     context = "\n".join(f"{t['role']}: {t['message']}" for t in mem)
     prompt = context + "\nassistant:"
 
-    result = await Runner.run(agent, input=prompt, run_config=config)
-    output = result.final_output.strip()
+    try:
+        result = await Runner.run(agent, input=prompt, run_config=config)
+        output = result.final_output.strip()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
 
-    # Add assistant response to memory buffer
     mem.append({"role": "assistant", "message": output})
 
-    # Handle structured output actions
     try:
         payload = json.loads(output)
     except json.JSONDecodeError:
@@ -313,4 +322,4 @@ async def list_agents():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

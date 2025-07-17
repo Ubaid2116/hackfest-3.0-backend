@@ -1,8 +1,9 @@
 fastapi
 uvicorn
-pydantic
 python-dotenv
-twilio
-schedule
+apscheduler
+requests
+pydantic
+python-multipart
+httpx
 openai-agents
-pyautogui
