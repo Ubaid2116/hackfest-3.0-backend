@@ -1,33 +1,37 @@
 import os
-import time
-import asyncio
-import threading
-import schedule
-from typing import Optional
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+import json
+import re
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from datetime import datetime
 from dotenv import load_dotenv
-from twilio.rest import Client
-import urllib
-import webbrowser 
-from agents import Agent, handoff, Runner, RunConfig, OpenAIChatCompletionsModel
-from openai import AsyncOpenAI
-from agents.handoffs import HandoffInputData
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
+import requests
+from collections import deque
+import uuid
+from agents import Agent, handoff, Runner, RunConfig, OpenAIChatCompletionsModel, function_tool, AsyncOpenAI
 
-# Load environment variables
 load_dotenv()
-api_key = os.getenv("GEMINI_API_KEY")
-twilio_sid = os.getenv("TWILIO_ACCOUNT_SID")
-twilio_token = os.getenv("TWILIO_AUTH_TOKEN")
-twilio_whatsapp_number = os.getenv("TWILIO_WHATSAPP_NUMBER")
 
-# Twilio client
-twilio_client = Client(twilio_sid, twilio_token)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+JOBSTORE_DB_URL = os.getenv("JOBSTORE_DB_URL", "sqlite:///jobs.sqlite")
+ULTRAMSG_TOKEN = os.getenv("ULTRAMSG_TOKEN")
+ULTRAMSG_INSTANCE_ID = os.getenv("ULTRAMSG_INSTANCE_ID")
 
-# Gemini client setup
+if not ULTRAMSG_TOKEN or not ULTRAMSG_INSTANCE_ID:
+    raise RuntimeError("Missing ULTRAMSG_TOKEN or ULTRAMSG_INSTANCE_ID in .env")
+
+# Scheduler setup
+scheduler = BackgroundScheduler(
+    jobstores={'default': SQLAlchemyJobStore(url=JOBSTORE_DB_URL)}
+)
+scheduler.start()
+
+# OpenAI/Gemini client setup
 external_client = AsyncOpenAI(
-    api_key=api_key,
+    api_key=GEMINI_API_KEY,
     base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
 )
 model = OpenAIChatCompletionsModel(
@@ -40,317 +44,273 @@ config = RunConfig(
     tracing_disabled=True
 )
 
-def open_whatsapp_web(to_phone: str, message: str):
-    """
-    Opens WhatsApp Web in the default browser with a prefilled message.
-    to_phone: E.164 without “+”, e.g. "923001234567"
-    message: plain text (will be URL‑encoded)
-    """
-    encoded_msg = urllib.parse.quote(message)
-    url = f"https://web.whatsapp.com/send?phone={to_phone}&text={encoded_msg}"
-    webbrowser.open(url)
-
-# Twilio-based WhatsApp Messaging Function
-def send_whatsapp_message(to_phone: str, message: str):
+@function_tool
+def send_whatsapp_reminder(to_phone: str, medicine: str):
+    msg = f"💊 Reminder: Time to take your {medicine}!"
     try:
-        twilio_client.messages.create(
-            body=message,
-            from_=twilio_whatsapp_number,
-            to=f"whatsapp:{to_phone}"
-        )
-        print(f"✅ Message sent to {to_phone}")
-    except Exception as e:
-        print(f"❌ Failed to send WhatsApp message: {e}")
+        url = f"https://api.ultramsg.com/{ULTRAMSG_INSTANCE_ID}/messages/chat"
+        payload = {"token": ULTRAMSG_TOKEN, "to": to_phone, "body": msg}
+        resp = requests.post(url, data=payload)
+        resp.raise_for_status()
+        return {"method": "whatsapp", "response": resp.json()}
+    except requests.RequestException as e:
+        print(f"Error sending WhatsApp reminder: {e}")
+        return {"method": "mock", "message": msg, "error": str(e)}
 
-# Schedule Reminder Job
-def schedule_reminder(phone_number: str, med_name: str, time_str: str):
-    def job():
-        msg = f"💊 Reminder from MediMate:\nIt's time to take your medicine: {med_name}."
-        send_whatsapp_message(phone_number, msg)
-    schedule.every().day.at(time_str).do(job)
+@function_tool
+def schedule_whatsapp_reminder(to_phone: str, medicine: str, time_str: str):
+    try:
+        hour, minute = map(int, time_str.split(':'))
+        assert 0 <= hour < 24 and 0 <= minute < 60
+    except Exception:
+        raise ValueError("Time must be in HH:MM (24-hour) format")
 
-def run_schedule():
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
+    job_id = f"whatsapp-{to_phone}-{medicine}-{time_str}"
+    if scheduler.get_job(job_id):
+        scheduler.remove_job(job_id)
+    scheduler.add_job(
+        send_whatsapp_reminder,
+        trigger='cron',
+        args=[to_phone, medicine],
+        hour=hour,
+        minute=minute,
+        id=job_id,
+        replace_existing=True
+    )
 
-# Start scheduler thread
-threading.Thread(target=run_schedule, daemon=True).start()
+@function_tool
+def _trigger_emergency_alert(patient_name: str, condition: str):
+    msg = (
+        f"🚨 Emergency Alert!\n"
+        f"Patient: {patient_name}\n"
+        f"Condition: {condition}\n"
+        "Please respond urgently!"
+    )
+    try:
+        url = f"https://api.ultramsg.com/{ULTRAMSG_INSTANCE_ID}/messages/chat"
+        payload = {"token": ULTRAMSG_TOKEN, "to": "+923412583056", "body": msg}
+        resp = requests.post(url, data=payload)
+        resp.raise_for_status()
+        return {"method": "whatsapp", "response": resp.json()}
+    except requests.RequestException as e:
+        print(f"Error sending WhatsApp message: {e}")
+        return {"method": "mock", "message": msg, "error": str(e)}
 
-# Define agents
+# Agent definitions
 welcome_agent = Agent(name="Welcome Agent", instructions="""
 You are the first point of contact for users seeking healthcare services.
-
-1. Greet the user politely.
-2. Clearly list the available services:
+1. Greet the user.
+2. List services:
    - General Checkup
    - Emergency Services
    - COVID-19 Information
    - Medicine Reminders
    - Dietary Advice
    - Mental Health Support
-
-3. Ask the user how you can assist them today.
-4. Do NOT provide any medical diagnosis, treatment, or recommendations.
-5. Only provide information about the available services listed above.
-6. If the user asks something unrelated to healthcare, reply: 
-   "I am a healthcare assistant and can only assist you with healthcare-related queries. Please ask me about healthcare services."
-
-7. If the user shares a specific concern, say:
-   "Please select the appropriate agent from the left side — this one will solve your issue."
+3. Ask how you can assist today.
 """)
 
-health_agent = Agent(name="Health Check Agent", instructions="""
-You are a medical support agent specialized in common health issues.
+health_agent = Agent(
+    name="Health Check Agent",
+    instructions="""
+You are a Health Check Agent. Your role is to analyze user-described symptoms and identify possible common health issues.
 
-1. Respond only to health-related symptoms or issues such as fever, cold, flu, stomach ache, headache, etc.
-2. Suggest safe, over-the-counter (OTC) medicines based on symptoms.
-   Example:
-   - For fever: Paracetamol (Panadol 500mg), every 6 hours.
-   - For pain relief: Ibuprofen (Advil 200mg), twice daily after meals.
+- First, politely ask the user for their **name** and **age** before analyzing any symptoms.
+  Example: "Before we begin, may I have your name and age?"
 
-3. Always recommend the user consult a doctor for proper examination.
-   Say: "For your safety, please book an appointment with a nearby general physician or family doctor."
+- After collecting the user's name and age, proceed to analyze the described symptoms.
 
-4. Never provide advice for serious conditions like heart problems, internal injuries, or anything life-threatening. Redirect such queries to the Emergency Agent.
+- If the symptoms indicate a **life-threatening or emergency condition**, immediately trigger the emergency alert using the appropriate tool and return the following message:
+  "Your condition appears to be an emergency. I have sent a message to the emergency department."
 
-5. Reject irrelevant or off-topic queries with this message:
-   "I am a healthcare assistant focused on health-related issues. Please ask a relevant health concern."
+- If it is **not an emergency**, identify the most appropriate **type of doctor or specialist** based on the symptoms.
+  Then respond with a message like:
+  "Based on your symptoms, it is recommended to consult a [specialist]. For your safety, please book an appointment with a nearby [specialist]."
+
+⚠️ Do not provide medical diagnoses. Only identify symptom patterns and recommend a relevant medical specialist when appropriate.
+""",
+    tools=[_trigger_emergency_alert]
+)
+
+mental_health_agent = Agent(name="Mental Health Agent", instructions="""
+Provide mental health support and guidance.
+- Offer coping strategies
+- Suggest professional help when needed
+- Be empathetic and non-judgmental
 """)
 
 covid_agent = Agent(name="COVID-19 Agent", instructions="""
-You are responsible for sharing accurate and updated COVID-19 information.
-
-1. Answer queries about:
-   - Vaccine types and availability
-   - COVID-19 symptoms
-   - Isolation guidelines
-   - Precautionary measures
-   - Testing procedures
-
-2. Do not suggest any medicines.
-3. Always advise users to consult a local hospital or health department for up-to-date testing and vaccination options.
-
-4. For any severe COVID symptoms, say:
-   "If you're experiencing shortness of breath, chest pain, or high fever, please visit the nearest hospital or call emergency services immediately."
-
-5. If user asks unrelated questions, say:
-   "I can only assist with COVID-19 related information. Please ask a relevant question."
+Share COVID-19 info on vaccines, symptoms, isolation, precautions, testing.
 """)
 
-emergency_agent = Agent(name="Emergency Agent", instructions="""
-You are handling life-threatening and urgent medical queries.
+emergency_agent = Agent(
+    name="Emergency Agent",
+    instructions="""
+You are an Emergency Response Agent. Your role is to handle life-threatening or critical medical situations.
 
-1. Always respond with urgency and direct action.
-2. Tell the user to immediately call a local ambulance service or go to the nearest emergency room.
-3. Do NOT try to diagnose or suggest medicines.
+1. When a user sends a message, check if both of the following are provided:
+   - **Patient Name**
+   - **Condition or medical issue**
 
-Example reply:
-"Please go to the nearest emergency department or call Edhi/Chhipa right now. This could be a serious condition requiring immediate attention."
+2. If either is missing, politely ask:
+   - "Please provide the patient's name."
+   - Or: "Please describe the patient's condition."
 
-4. If WhatsApp alert is configured, initiate it.
-5. Never entertain non-emergency or irrelevant questions. Respond:
-   "This agent is for emergency medical help only. Please ask a relevant emergency concern."
-""")
+3. Once both the patient's name and condition are received, trigger the emergency alert using the provided tool.
 
-medicine_agent = Agent(name="Medicine Reminder Agent", instructions="""
-You are responsible for creating and scheduling personalized medicine reminders.
+4. Respond to the user with:
+   "Your emergency has been reported to the concerned department. Help is on the way."
 
-1. Ask the user for the following:
-   - Medicine name
-   - Dosage instructions (e.g., 1 tablet after lunch)
-   - Reminder time
-   - Phone number for WhatsApp reminders
+Do not request any specific message format.
+Do not provide medical advice. Focus only on detecting emergencies and triggering alerts.
+""",
+    tools=[_trigger_emergency_alert]
+)
 
-2. Schedule WhatsApp reminders using the provided data.
-3. Use this format for WhatsApp:
-   "💊 Reminder: Take 1 tablet of Panadol after lunch."
 
-4. Do NOT suggest new medicines — forward that to the Health Agent.
-5. If the user describes symptoms, reply:
-   "Please ask the Health Check Agent for proper medicine based on your symptoms."
+medicine_agent = Agent(
+    name="Medicine Reminder Agent",
+    instructions="""
+You are a Medicine Reminder Agent. Your job is to collect the following information from the user:
 
-6. Never reply to irrelevant queries.
-""")
+- **Phone number** (e.g. +923001112233)
+- **Medicine name** (e.g. Paracetamol, Ibuprofen)
+- **Reminder time** in 24-hour format (HH:MM) — e.g. 08:00, 14:30
+
+Once you collect all three fields:
+1. Use the `schedule_whatsapp_reminder` tool to schedule a daily WhatsApp reminder.
+2. Confirm to the user with a message like:
+   "✅ Your reminder for [medicine] has been successfully scheduled at [time_str] daily via WhatsApp."
+
+Important:
+- Ensure the phone number is in international format (e.g., +923001112233).
+- Ensure the time format is valid (HH:MM in 24-hour format).
+- Do **not** allow incomplete or invalid input to proceed.
+
+You do not provide medical advice. Your role is strictly to schedule medication reminders via WhatsApp.
+""",
+    tools=[schedule_whatsapp_reminder, send_whatsapp_reminder]
+)
 
 diet_agent = Agent(name="Diet Agent", instructions="""
-You are a dietary assistant helping users with food advice based on medical conditions.
-
-1. Suggest general diet plans for issues like:
-   - Diabetes
-   - Hypertension
-   - Weight loss/gain
-   - Acid reflux
-   - Anemia
-
-2. Example:
-   - "For diabetes, follow a low-carb, high-fiber diet with whole grains, vegetables, and lean proteins. Avoid sugar and refined carbs."
-
-3. Clearly mention that your advice is general and that a licensed dietitian should be consulted for a personalized plan.
-
-4. Do not give advice unrelated to diet or nutrition.
-
-5. If a user asks something irrelevant, respond:
-   "This agent provides dietary recommendations only. Please ask about food or diet-related concerns."
-""")
-
-mental_health_agent = Agent(name="Mental Health Agent", instructions="""
-You provide basic mental health support and emergency resources.
-
-1. Help with emotional distress, anxiety, depression, stress, or burnout.
-2. Share basic coping strategies:
-   - Breathing exercises
-   - Talking to friends/family
-   - Avoiding isolation
-   - Staying active
-
-3. Ask the user's city/location and suggest visiting a nearby psychiatrist or mental health clinic.
-
-Example:
-   "You may visit the Institute of Psychiatry in your city or consult a certified mental health professional near you."
-
-4. Never try to diagnose or suggest medication.
-5. If someone expresses suicidal thoughts or extreme distress:
-   "Please reach out to a mental health crisis line or go to the nearest hospital immediately."
-
-6. Reject non-mental health queries:
-   "This agent only provides support for mental health. Please ask a relevant concern."
+Provide dietary advice based on:
+- Health conditions
+- Nutritional needs
+- Dietary restrictions
+- Always recommend consulting a nutritionist for personalized plans
 """)
 
 registration_agent = Agent(name="Registration Agent", instructions="""
-You collect patient details and route them to the appropriate agent.
-
-1. Always ask for the following:
-   - Full Name
-   - Phone Number
-   - Age
-   - Required Service (e.g., diet, health checkup, emergency, etc.)
-
-2. Based on the service, forward the user to the correct agent.
-
-3. If the service is unrecognized, politely ask for clarification:
-   "Can you please mention the service you’re looking for from this list?"
-
-4. Do not answer any medical queries or provide suggestions. You only handle registration.
-
-5. If a user asks irrelevant questions, say:
-   "I'm here to collect your registration details for the healthcare system. Please provide your full name, age, phone number, and required service."
+Collect name, email, age, desired service and hand off accordingly.
 """)
 
-
-# Configure handoffs
-
+# Registration handoffs
 def make_filter(keyword: str):
     return lambda x: x if keyword in x.input_history.lower() else None
 
 registration_agent.handoffs = [
     handoff(health_agent, input_filter=make_filter("health")),
+    handoff(mental_health_agent, input_filter=make_filter("mental")),
     handoff(covid_agent, input_filter=make_filter("covid")),
     handoff(emergency_agent, input_filter=make_filter("emergency")),
-    handoff(medicine_agent, input_filter=make_filter("medicine")),
+    handoff(medicine_agent, input_filter=make_filter("reminder")),
     handoff(diet_agent, input_filter=make_filter("diet")),
-    handoff(mental_health_agent, input_filter=make_filter("mental")),
 ]
 
-# --- MODELS ---
-class PatientRegistration(BaseModel):
-    name: str
-    phone: str
-    age: int
-    service: str
+SHORT_TERM_MEMORY_TURNS = 10
+short_memory = {}
 
-class AgentQuery(BaseModel):
-    agent_name: str
+def get_memory_deque(session_id: str):
+    if session_id not in short_memory:
+        short_memory[session_id] = deque(maxlen=SHORT_TERM_MEMORY_TURNS)
+    return short_memory[session_id]
+
+# FastAPI app setup
+app = FastAPI(title="NeuroNestAI Healthcare API", version="2.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
+                   allow_methods=["*"], allow_headers=["*"])
+
+class ChatRequest(BaseModel):
     message: str
+    agent: str = "Welcome Agent"
+    timestamp: str = Field(default_factory=lambda: datetime.now().isoformat())
+    session_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
 
-class EmergencyAlert(BaseModel):
-    patient_name: str
-    condition: str
-
-class ReminderRequest(BaseModel):
-    phone: str         # E.164 format e.g., +923001234567
-    medicine_name: str
-    reminder_time: str # HH:MM (24-hour format)
-
-# --- FASTAPI APP ---
-app = FastAPI(
-    title="MediMate Healthcare API",
-    description="API for healthcare agent system with WhatsApp reminders",
-    version="2.0.0"
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"]
-)
+agents = {
+    "Welcome Agent": welcome_agent,
+    "Health Check Agent": health_agent,
+    "Mental Health Agent": mental_health_agent,
+    "COVID-19 Agent": covid_agent,
+    "Emergency Agent": emergency_agent,
+    "Medicine Reminder Agent": medicine_agent,
+    "Diet Agent": diet_agent,
+    "Registration Agent": registration_agent,
+}
 
 @app.on_event("startup")
 async def startup_event():
     await Runner.run(welcome_agent, input="Hello", run_config=config)
 
-@app.post("/api/register")
-async def register_patient(reg: PatientRegistration):
-    user_input = f"Service: {reg.service}\nName: {reg.name}\nPhone: {reg.phone}\nAge: {reg.age}"
-    result = await Runner.run(registration_agent, input=user_input, run_config=config)
-    return {"response": result.final_output, "next_agent": result.last_agent.name}
+def parse_emergency_input(message: str) -> tuple[str, str]:
+    patient_name = "Unknown"
+    condition = "unspecified"
+    
+    name_match = re.search(r"Patient:\s*([^\n,]+)", message, re.IGNORECASE)
+    condition_match = re.search(r"Condition:\s*([^\n]+)", message, re.IGNORECASE)
+    
+    if name_match:
+        patient_name = name_match.group(1).strip()
+    if condition_match:
+        condition = condition_match.group(1).strip()
+        
+    return patient_name, condition
 
-@app.post("/api/query")
-async def agent_query(query: AgentQuery):
-    agents = {
-        a.name: a for a in [
-            welcome_agent, health_agent, covid_agent, emergency_agent,
-            medicine_agent, diet_agent, mental_health_agent, registration_agent
-        ]
-    }
-    agent = agents.get(query.agent_name)
+@app.post("/api/chat")
+async def chat_with_agent(chat: ChatRequest):
+    agent = agents.get(chat.agent)
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
-    result = await Runner.run(agent, input=query.message, run_config=config)
-    return {"response": result.final_output}
 
-@app.post("/api/emergency")
-def send_emergency_alert(alert: EmergencyAlert):
-    # Build the message
-    msg = (
-        f"🚨 Emergency Alert!\n"
-        f"Patient: {alert.patient_name}\n"
-        f"Condition: {alert.condition}\n"
-        "Please respond urgently!"
-    )
-    hospital_number = "923412583056"  
-    open_whatsapp_web(hospital_number, msg)
+    # Add user message to memory buffer
+    mem = get_memory_deque(chat.session_id)
+    mem.append({"role": "user", "message": chat.message})
 
-    return {"status": "Emergency message opened in WhatsApp Web"}
+    # Compose contextual prompt
+    context = "\n".join(f"{t['role']}: {t['message']}" for t in mem)
+    prompt = context + "\nassistant:"
 
-@app.post("/api/medicine-reminder")
-def create_reminder(rem: ReminderRequest):
-    if not rem.phone.isdigit():
-        raise HTTPException(status_code=400, detail="Phone must be digits like 923001234567")
+    result = await Runner.run(agent, input=prompt, run_config=config)
+    output = result.final_output.strip()
 
-    schedule_reminder(rem.phone, rem.medicine_name, rem.reminder_time)
-    return {
-        "status": "Reminder scheduled successfully",
-        "phone": rem.phone,
-        "medicine": rem.medicine_name,
-        "time": rem.reminder_time
-    }
+    # Add assistant response to memory buffer
+    mem.append({"role": "assistant", "message": output})
 
-@app.get("/api/services")
-def list_services():
-    return {
-        "services": [
-            "General Checkup",
-            "Emergency Services",
-            "COVID-19 Information",
-            "Medicine Reminders",
-            "Dietary Advice",
-            "Mental Health Support"
-        ]
-    }
+    # Handle structured output actions
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError:
+        return {"response": output}
 
-# --- Run the app ---
+    action = payload.get("action")
+    if action == "schedule_reminder":
+        phone = payload["phone"]
+        medicine = payload["medicine_name"]
+        time_ = payload["reminder_time"]
+        schedule_whatsapp_reminder(phone, medicine, time_)
+        return {"response": f"✅ Reminder set for {medicine} at {time_} via WhatsApp to {phone}."}
+
+    if action == "emergency_alert":
+        name = payload.get("patient_name", "Unknown")
+        condition = payload.get("condition", "unspecified")
+        _trigger_emergency_alert(name, condition)
+        return {"response": f"🚨 Emergency alert sent to the emergency department via WhatsApp for {name} with condition: {condition}."}
+
+    return {"response": output}
+
+@app.get("/api/agents")
+async def list_agents():
+    return {"agents": list(agents.keys())}
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)

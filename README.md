@@ -12,8 +12,7 @@ A FastAPI-based backend service to power a healthcare chatbot system with:
 ### 📂 Repository Structure
 
 ```
-├── app.py               # Main FastAPI application
-├── agents/              # Folder containing Agent definitions and handoff logic
+├── main.py               # Main Agent & FastAPI application
 ├── requirements.txt     # List of dependencies (no versions)
 ├── .env.example         # Sample environment variables file
 ├── README.md            # Project documentation (this file)
